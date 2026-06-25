@@ -1,0 +1,19 @@
+# SwiftPM build products
+.build/
+.swiftpm/
+
+# Assembled .app bundle produced by build.sh
+build/
+
+# Xcode (if you ever open the package in it)
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# macOS cruft
+.DS_Store
+
+# Misc
+*.swp
+*~
