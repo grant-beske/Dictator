@@ -13,8 +13,51 @@ final class OverlayController {
 
   private var panel: NSPanel?
   private var waveView: WaveformView?
+  private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
   private let size = NSSize(width: 300, height: 54)
+
+  init() {
+    // The panel is created once and reused for the whole process. Across a
+    // sleep/wake or a display reconfiguration (opening the lid, (un)plugging an
+    // external monitor, Space/resolution changes) the long-lived status-bar
+    // panel's window-server state can go stale and silently stop drawing — the
+    // HUD never appears even though recording/sounds work, and only a relaunch
+    // fixes it. Guard against that by dropping the panel on those transitions so
+    // the next show() rebuilds a fresh one.
+    let ws = NSWorkspace.shared.notificationCenter
+    observers.append((ws, ws.addObserver(
+      forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        self?.invalidatePanel(reason: "wake")
+      }))
+    let nc = NotificationCenter.default
+    observers.append((nc, nc.addObserver(
+      forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+        self?.invalidatePanel(reason: "screen-change")
+      }))
+  }
+
+  deinit {
+    for (center, token) in observers { center.removeObserver(token) }
+  }
+
+  // Build the panel up front so the first dictation doesn't pay the allocation
+  // + first CALayer draw cost on its initial show() (the "lag on first
+  // appearance" after launch). Safe to call repeatedly; no-ops once built.
+  func prepare() {
+    makePanelIfNeeded()
+  }
+
+  // Drop the current panel so the next show() builds a fresh one. See init() for
+  // why: the reused panel can go stale after sleep/wake or a display change.
+  private func invalidatePanel(reason: String) {
+    guard panel != nil else { return }
+    NSLog("Dictator: overlay invalidated (\(reason)) — rebuilding on next show")
+    waveView?.stopAnimating()
+    panel?.orderOut(nil)
+    panel = nil
+    waveView = nil
+  }
 
   private func makePanelIfNeeded() {
     guard panel == nil else { return }
@@ -45,11 +88,26 @@ final class OverlayController {
   private func reposition() {
     guard let panel = panel else { return }
     let mouse = NSEvent.mouseLocation
-    let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
-    guard let visible = screen?.visibleFrame else { return }
-    let x = visible.midX - size.width / 2
-    let y = visible.maxY - size.height - 16
+    // Fall back all the way to the first available screen: right after wake
+    // NSScreen.main can momentarily be nil/stale, and we must NOT leave the
+    // panel at an origin computed for the previous display layout (which could
+    // be off the now-visible screen).
+    let screen = NSScreen.screens.first { $0.frame.contains(mouse) }
+      ?? NSScreen.main ?? NSScreen.screens.first
+    guard let visible = screen?.visibleFrame else {
+      NSLog("Dictator: overlay reposition found NO screen — HUD may not be visible")
+      return
+    }
+    var x = visible.midX - size.width / 2
+    var y = visible.maxY - size.height - 16
+    // Clamp fully on-screen in case visibleFrame is unexpectedly small/odd.
+    x = min(max(x, visible.minX), visible.maxX - size.width)
+    y = min(max(y, visible.minY), visible.maxY - size.height)
     panel.setFrameOrigin(NSPoint(x: x, y: y))
+    // Diagnostic: every HUD appearance records where it was placed and on which
+    // screen, so a recurrence of the "overlay didn't appear" bug leaves evidence
+    // in the log instead of needing a repro. (See CLAUDE.md → Diagnostics.)
+    NSLog("Dictator: overlay positioned at (\(Int(x)), \(Int(y))) on visibleFrame \(NSStringFromRect(visible))")
   }
 
   // MARK: API (main thread)

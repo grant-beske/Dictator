@@ -60,6 +60,29 @@ runnable as a bare binary in a useful way — it needs the bundle's Info.plist
 - **Transcript is intentionally left on the clipboard** after pasting (no restore
   of the previous clipboard) — the user wants a re-paste safety net for
   mis-focused dictations. Don't "fix" this back to save/restore.
+- **The overlay panel is rebuilt on sleep/wake and display changes.** The single
+  long-lived `NSPanel` can go stale across a sleep/wake or display
+  reconfiguration and silently stop drawing (HUD never appears, but recording +
+  sounds still work). `OverlayController` observes `NSWorkspace.didWakeNotification`
+  and `NSApplication.didChangeScreenParametersNotification` and drops the panel so
+  the next `show()` rebuilds a fresh one. Don't remove these observers or make the
+  panel a one-time singleton.
+
+## Diagnostics / logging
+
+The overlay emits `NSLog` lines (visible via `log stream --predicate 'process ==
+"Dictator"'` or Console.app) to make the intermittent "HUD didn't appear" bug
+self-evidencing if it recurs:
+
+- `overlay positioned at (x, y) on visibleFrame …` — logged on **every** HUD
+  appearance (`OverlayController.reposition`). If the bug recurs, check whether
+  this line is missing (show path never reached) or shows an off-screen origin.
+- `overlay reposition found NO screen …` — no usable `NSScreen` at show time.
+- `overlay invalidated (wake|screen-change) …` — the panel was dropped and will
+  be rebuilt on next show.
+
+If you change the overlay show/position path, keep these logs (or update this
+section to match).
 
 ## Conventions
 

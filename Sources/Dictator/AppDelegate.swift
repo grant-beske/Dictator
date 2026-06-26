@@ -38,6 +38,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     recorder.waveformGain = Float(config.waveformGain)
     recorder.onSpectrum = { [weak self] bands in self?.overlay.update(spectrum: bands) }
 
+    // Build the HUD panel now so the first dictation's show() isn't slow. The
+    // overlay also rebuilds itself on sleep/wake and display changes — see
+    // OverlayController.init.
+    overlay.prepare()
+
     // Set up customizable cue sounds (creates the Sounds folder on first run).
     sounds.enabled = config.soundsEnabled
     sounds.ensureDirectory()
