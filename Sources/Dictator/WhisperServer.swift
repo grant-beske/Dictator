@@ -30,19 +30,26 @@ final class WhisperServer {
 
   // MARK: Locating the Homebrew binary + resources
 
-  // Find whisper-server: prefer Apple-Silicon Homebrew, then Intel, then PATH.
+  // Find whisper-server. macOS: prefer Apple-Silicon Homebrew, then Intel.
+  // Linux: common system prefixes plus a source build at ~/whisper.cpp. Falls
+  // back to PATH via `which` on both.
   private static func serverExecutable() -> String? {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
     let candidates = ["/opt/homebrew/bin/whisper-server",
-                      "/usr/local/bin/whisper-server"]
+                      "/usr/local/bin/whisper-server",
+                      "/usr/bin/whisper-server",
+                      "\(home)/whisper.cpp/build/bin/whisper-server"]
     for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
       return path
     }
-    return runCapturing("/usr/bin/which", ["whisper-server"])?
+    return runCapturing("/usr/bin/env", ["which", "whisper-server"])?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .nonEmpty
   }
 
-  // `brew --prefix whisper-cpp` + "/share/whisper-cpp"
+  #if os(macOS)
+  // `brew --prefix whisper-cpp` + "/share/whisper-cpp" — needed only for the
+  // macOS Metal backend (see GGML_METAL_PATH_RESOURCES below).
   private static func metalResourcesPath() -> String? {
     let brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
       .first { FileManager.default.isExecutableFile(atPath: $0) }
@@ -52,6 +59,7 @@ final class WhisperServer {
             .nonEmpty else { return nil }
     return prefix + "/share/whisper-cpp"
   }
+  #endif
 
   private static func runCapturing(_ launchPath: String, _ args: [String]) -> String? {
     let p = Process()
@@ -97,15 +105,18 @@ final class WhisperServer {
     if noTimestamps { args.append("-nt") }
     p.arguments = args
 
-    // Inherit the environment and inject the Metal resources path so GPU
-    // acceleration actually engages.
+    // Inherit the environment. On macOS, inject the Metal resources path so GPU
+    // acceleration actually engages. On Linux the CUDA/Vulkan/CPU backends are
+    // selected at whisper.cpp build time and need no such env var.
     var env = ProcessInfo.processInfo.environment
+    #if os(macOS)
     if let resources = Self.metalResourcesPath() {
       env["GGML_METAL_PATH_RESOURCES"] = resources
       NSLog("Dictator: GGML_METAL_PATH_RESOURCES=\(resources)")
     } else {
       NSLog("Dictator: could not resolve whisper-cpp resources path; Metal may be slow")
     }
+    #endif
     p.environment = env
 
     // Drain stderr/stdout to the unified log so problems are diagnosable.

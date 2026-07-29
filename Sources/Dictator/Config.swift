@@ -32,6 +32,10 @@ struct Config: Codable {
   // Play start/stop/done cue sounds (from the Sounds folder).
   var soundsEnabled: Bool
 
+  // Pause currently-playing media (Music, Spotify, a YouTube tab, …) while
+  // dictating, then resume it afterwards — like SuperWhisper.
+  var pauseMediaWhileRecording: Bool
+
   // Visual gain for the recording waveform. Raise it if the bars look too
   // small when you speak; lower it if they're always maxed out.
   var waveformGain: Double
@@ -44,6 +48,18 @@ struct Config: Codable {
   // newlines whisper otherwise inserts.
   var noTimestamps: Bool
 
+  // Linux only (ignored on macOS). How the daemon starts/stops recording:
+  //  - "socket": toggle mode — bind a desktop keyboard shortcut to
+  //    `dictator toggle`, which signals the running daemon. No special
+  //    permissions; works on both X11 and Wayland. This is the default.
+  //  - "evdev": true push-to-talk — read key press/release from /dev/input
+  //    directly (below the display server). Needs your user in the `input`
+  //    group. Uses `linuxPushToTalkKey` as the hold key.
+  var linuxInputMode: String
+  // Linux evdev push-to-talk key code (EV_KEY code). 97 == KEY_RIGHTCTRL.
+  // Common alternatives: 100 (KEY_RIGHTALT), 125 (KEY_LEFTMETA / Super).
+  var linuxPushToTalkKey: Int
+
   static let `default` = Config(
     modelPath: "~/whisper-models/ggml-large-v3-turbo-q5_0.bin",
     hotkeyMode: "pushToTalk",
@@ -53,24 +69,92 @@ struct Config: Codable {
     serverPort: 8080,
     language: "en",
     soundsEnabled: true,
+    pauseMediaWhileRecording: true,
     waveformGain: 1.4,
     beamSize: 3,
     bestOf: 5,
-    noTimestamps: true
+    noTimestamps: true,
+    linuxInputMode: "socket",
+    linuxPushToTalkKey: 97          // KEY_RIGHTCTRL
   )
 
   // Model path with a leading ~ expanded to the home directory.
   var resolvedModelPath: String {
-    (modelPath as NSString).expandingTildeInPath
+    #if os(macOS)
+    return (modelPath as NSString).expandingTildeInPath
+    #else
+    // NSString.expandingTildeInPath is unreliable on Linux Foundation; expand
+    // a leading ~ ourselves against the current user's home directory.
+    guard modelPath == "~" || modelPath.hasPrefix("~/") else { return modelPath }
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    return home + modelPath.dropFirst()
+    #endif
+  }
+
+  // Memberwise init (no longer free once we add a custom decoder below).
+  init(modelPath: String, hotkeyMode: String, pushToTalkModifiers: [String],
+       toggleKeyCode: Int, toggleModifiers: [String], serverPort: Int,
+       language: String, soundsEnabled: Bool, pauseMediaWhileRecording: Bool,
+       waveformGain: Double, beamSize: Int, bestOf: Int, noTimestamps: Bool,
+       linuxInputMode: String, linuxPushToTalkKey: Int) {
+    self.modelPath = modelPath
+    self.hotkeyMode = hotkeyMode
+    self.pushToTalkModifiers = pushToTalkModifiers
+    self.toggleKeyCode = toggleKeyCode
+    self.toggleModifiers = toggleModifiers
+    self.serverPort = serverPort
+    self.language = language
+    self.soundsEnabled = soundsEnabled
+    self.pauseMediaWhileRecording = pauseMediaWhileRecording
+    self.waveformGain = waveformGain
+    self.beamSize = beamSize
+    self.bestOf = bestOf
+    self.noTimestamps = noTimestamps
+    self.linuxInputMode = linuxInputMode
+    self.linuxPushToTalkKey = linuxPushToTalkKey
+  }
+
+  // Tolerant decoding: any key missing from an older config.json falls back to
+  // its default rather than failing the whole decode (which would reset every
+  // setting). This is what lets us add new options without disrupting users.
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    let d = Config.default
+    func g<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+      (try? c.decode(T.self, forKey: key)) ?? fallback
+    }
+    modelPath = g(.modelPath, d.modelPath)
+    hotkeyMode = g(.hotkeyMode, d.hotkeyMode)
+    pushToTalkModifiers = g(.pushToTalkModifiers, d.pushToTalkModifiers)
+    toggleKeyCode = g(.toggleKeyCode, d.toggleKeyCode)
+    toggleModifiers = g(.toggleModifiers, d.toggleModifiers)
+    serverPort = g(.serverPort, d.serverPort)
+    language = g(.language, d.language)
+    soundsEnabled = g(.soundsEnabled, d.soundsEnabled)
+    pauseMediaWhileRecording = g(.pauseMediaWhileRecording, d.pauseMediaWhileRecording)
+    waveformGain = g(.waveformGain, d.waveformGain)
+    beamSize = g(.beamSize, d.beamSize)
+    bestOf = g(.bestOf, d.bestOf)
+    noTimestamps = g(.noTimestamps, d.noTimestamps)
+    linuxInputMode = g(.linuxInputMode, d.linuxInputMode)
+    linuxPushToTalkKey = g(.linuxPushToTalkKey, d.linuxPushToTalkKey)
   }
 }
 
 enum ConfigStore {
-  // ~/Library/Application Support/Dictator
+  // macOS: ~/Library/Application Support/Dictator
+  // Linux: $XDG_CONFIG_HOME/dictator (default ~/.config/dictator)
   static var directory: URL {
+    #if os(Linux)
+    let env = ProcessInfo.processInfo.environment
+    let base = env["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+      ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config")
+    return base.appendingPathComponent("dictator", isDirectory: true)
+    #else
     let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                         in: .userDomainMask)[0]
     return base.appendingPathComponent("Dictator", isDirectory: true)
+    #endif
   }
 
   static var fileURL: URL {

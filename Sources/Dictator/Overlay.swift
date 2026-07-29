@@ -17,6 +17,18 @@ final class OverlayController {
 
   private let size = NSSize(width: 300, height: 54)
 
+  // Spaces behavior for the HUD. CRITICAL with MULTIPLE full-screen apps: each
+  // full-screen app is its own Space. `.canJoinAllSpaces` + `.fullScreenAuxiliary`
+  // lets the panel appear on the *currently active* Space, including over a
+  // full-screen app. We intentionally do NOT set `.stationary` here: it's an
+  // Exposé behavior that, combined with the above, pins the panel to a single
+  // full-screen Space (the one it was first ordered into — e.g. the app you slept
+  // on), so it shows there and is occluded everywhere else. We also re-assert this
+  // on every show() (see show()) because the active full-screen Space changes
+  // between dictations and the association must be refreshed.
+  private static let spaceBehavior: NSWindow.CollectionBehavior =
+    [.canJoinAllSpaces, .fullScreenAuxiliary]
+
   init() {
     // The panel is created once and reused for the whole process. Across a
     // sleep/wake or a display reconfiguration (opening the lid, (un)plugging an
@@ -74,7 +86,7 @@ final class OverlayController {
     panel.ignoresMouseEvents = true
     panel.hidesOnDeactivate = false
     panel.isMovable = false
-    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+    panel.collectionBehavior = Self.spaceBehavior
 
     // The view draws the (non-rectangular) hexagon itself; the window is clear,
     // so the drop shadow follows the hexagon's alpha.
@@ -118,12 +130,31 @@ final class OverlayController {
     guard let panel = panel, let wave = waveView else { return }
     wave.mode = (mode == .recording) ? .recording : .processing
     wave.startAnimating()
+    // Re-assert Spaces membership every show so the panel lands on whatever Space
+    // is active now — including a different full-screen app's Space than last time.
+    // (Diagnosed via the post-show `occluded=true` logs while on other full-screen
+    // apps; see CLAUDE.md → Diagnostics.)
+    panel.collectionBehavior = Self.spaceBehavior
     panel.alphaValue = 0
     panel.orderFrontRegardless()
     panel.invalidateShadow()  // recompute shadow for the hexagon shape
     NSAnimationContext.runAnimationGroup { ctx in
       ctx.duration = 0.18
       panel.animator().alphaValue = 1
+    }
+
+    // Anomaly-only health check shortly after show (occlusionState needs a beat
+    // to settle after orderFront). In the healthy path the HUD is opaque and on
+    // the active Space, so we stay silent. We log ONLY when the window is
+    // occluded (sitting on a Space you're not viewing — the multi-full-screen-app
+    // bug) or transparent (a dropped alpha fade), so a regression self-reports
+    // without per-dictation noise. (See CLAUDE.md → Diagnostics.)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+      guard let self = self, let panel = self.panel, panel.isVisible else { return }
+      let occluded = !panel.occlusionState.contains(.visible)
+      guard occluded || panel.alphaValue < 0.99 else { return }
+      let screen = panel.screen.map { NSStringFromRect($0.frame) } ?? "nil"
+      NSLog("Dictator: overlay post-show ANOMALY alpha=\(panel.alphaValue) occluded=\(occluded) screen=\(screen)")
     }
   }
 

@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private let hotkeys = HotkeyManager()
   private let overlay = OverlayController()
   private let sounds = SoundPlayer()
+  private let media = MediaController()
   private var server: WhisperServer!
   private var transcriber: Transcriber!
 
@@ -191,6 +192,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       try recorder.start(to: url)
       currentWavURL = url
       state = .recording
+      // Pause any playing media (YouTube, Spotify, Music…) so we don't dictate
+      // over it; resumed in stopRecordingAndTranscribe. Done after start()
+      // succeeds so a failed recording never leaves media paused.
+      if config.pauseMediaWhileRecording { media.pauseIfPlaying() }
       overlay.show(mode: .recording)  // floating waveform HUD
       sounds.play(.start)             // "recording opened" cue
     } catch {
@@ -203,6 +208,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private func stopRecordingAndTranscribe() {
     guard state == .recording else { return }
     recorder.stop()
+    // Resume whatever media we paused on record start (no-op if we paused none).
+    if config.pauseMediaWhileRecording { media.resumeIfPaused() }
     state = .transcribing
     sounds.play(.stop)       // "recording closed" cue
     overlay.setProcessing()  // swap waveform for the "thinking" animation

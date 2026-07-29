@@ -1,4 +1,9 @@
 import Foundation
+// On Linux, URLSession lives in a separate module (FoundationNetworking); on
+// macOS it's part of Foundation. This import is a no-op where it's absent.
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 // Sends a WAV file to the resident whisper-server's /inference endpoint as a
 // multipart/form-data upload and reads back the transcript.
@@ -51,8 +56,16 @@ struct Transcriber {
       .components(separatedBy: .whitespacesAndNewlines)
       .filter { !$0.isEmpty }
       .joined(separator: " ")
-    guard !normalized.isEmpty else { throw TranscribeError.empty }
-    return normalized
+
+    // whisper sometimes prefixes a transcript with a dash/bullet — a hallucinated
+    // subtitle/dialogue marker (e.g. "- hello there"). Strip any leading run of
+    // those symbols plus the space that follows. We only touch the very start,
+    // so legitimate dashes mid-sentence ("twenty-one", "well — maybe") survive.
+    let leadingMarkers = CharacterSet(charactersIn: "-–—•*").union(.whitespaces)
+    let cleaned = String(normalized.drop { leadingMarkers.contains($0.unicodeScalars.first!) })
+
+    guard !cleaned.isEmpty else { throw TranscribeError.empty }
+    return cleaned
   }
 
   // Hand-build the multipart body: one file part + several plain text fields.
