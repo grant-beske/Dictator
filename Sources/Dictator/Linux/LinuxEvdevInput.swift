@@ -46,6 +46,7 @@ final class LinuxEvdevInput {
           + "(add your user to the 'input' group, then log out and back in)")
       return false
     }
+    NSLog("Dictator: evdev reading \(fds.count) input device(s), hold key code \(keyCode) to dictate")
     running = true
     let t = Thread { [weak self] in self?.loop() }
     t.stackSize = 1 << 20
@@ -84,9 +85,11 @@ final class LinuxEvdevInput {
           guard type == 1, code == keyCode else { continue }   // EV_KEY only
           if value == 1 && !held {          // key down (value 2 == autorepeat)
             held = true
+            NSLog("Dictator: evdev key \(keyCode) down")
             DispatchQueue.main.async { self.onStart() }
           } else if value == 0 && held {    // key up
             held = false
+            NSLog("Dictator: evdev key \(keyCode) up")
             DispatchQueue.main.async { self.onStop() }
           }
         }

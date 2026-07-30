@@ -140,6 +140,19 @@ headless in the container; audio/clipboard/evdev need a real desktop session.
 - **The Linux daemon has no GUI to test in CI**, but the control plane
   (help/status/toggle/quit, PID file, config creation, SIGTERM shutdown) runs
   headless — smoke-test it in the `swift:6.0` container after Linux changes.
+- **Linux signal handling uses the self-pipe trick, NOT `DispatchSource`
+  signal sources.** `DispatchSource.makeSignalSource` + `signal(sig, SIG_IGN)`
+  works on macOS (kqueue) but is unreliable on Linux libdispatch — an ignored
+  signal can be discarded before the source observes it, so `dictator toggle`
+  (which `kill`s the daemon with SIGUSR1) did nothing. A plain C handler
+  (`dictatorSignalHandler`) writes the signum to a pipe; a `DispatchSource` READ
+  source drains it on `.main` and dispatches toggle/quit. Don't switch it back to
+  a signal source. `SIGUSR1`=toggle, `SIGTERM`/`SIGINT`=quit.
+- **The Linux daemon logs each pipeline step via `NSLog`** (toggle received,
+  recorder launched/exited with its stderr, transcribing N bytes, inserted/
+  clipboard, shutdown) — the daemon is headless with no HUD, so this log (seen by
+  running `dictator daemon` in the foreground) is the only way to see what it's
+  doing. Keep the steps loud.
 
 ## Diagnostics / logging
 

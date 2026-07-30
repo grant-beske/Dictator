@@ -5,6 +5,17 @@ import Glibc
 import FoundationNetworking
 #endif
 
+// Write end of the self-pipe (see LinuxDaemon.installSignalHandlers). File-scope
+// because a C signal handler can't capture Swift context. -1 until installed.
+private var gSignalWriteFD: Int32 = -1
+
+// Async-signal-safe signal handler: write the signal number into the pipe and
+// return. All real work happens on the main queue in the read source's handler.
+private func dictatorSignalHandler(_ signum: Int32) {
+  var byte = UInt8(truncatingIfNeeded: signum)
+  _ = write(gSignalWriteFD, &byte, 1)
+}
+
 // Entry point for the Linux build (called from main.swift). One binary is both
 // the daemon and its little CLI client:
 //
@@ -71,7 +82,7 @@ final class LinuxDaemon {
   private var transcriber: Transcriber!
   private var evdev: LinuxEvdevInput?
   private var currentWavURL: URL?
-  private var signalSources: [DispatchSourceSignal] = []
+  private var signalReadSource: DispatchSourceRead?
 
   // MARK: Daemon lifecycle
 
@@ -109,6 +120,7 @@ final class LinuxDaemon {
   }
 
   private func shutdown() -> Never {
+    NSLog("Dictator: shutting down")
     if state == .recording { recorder.stop() }
     if config.pauseMediaWhileRecording { media.resumeIfPaused() }
     evdev?.stop()
@@ -137,27 +149,53 @@ final class LinuxDaemon {
 
   // MARK: Signals (control channel)
 
+  // We deliberately do NOT use DispatchSource.makeSignalSource here. On Linux,
+  // that combined with signal(sig, SIG_IGN) is unreliable — an ignored signal
+  // can be discarded by the kernel before the source ever observes it, so the
+  // daemon would never react to `dictator toggle` (the exact bug this fixes).
+  //
+  // Instead we use the classic "self-pipe" trick: a plain C signal handler (the
+  // top-level dictatorSignalHandler) writes the signal number into a pipe, and a
+  // DispatchSource READ source — which is rock-solid on Linux — drains it on the
+  // main queue and does the real work. write()/read() on a pipe are the only
+  // async-signal-safe primitives involved.
   private func installSignalHandlers() {
-    // Ignore the default disposition so the DispatchSource observers fire
-    // instead of the process being killed / no-op'd.
-    signal(SIGUSR1, SIG_IGN)
-    signal(SIGTERM, SIG_IGN)
-    signal(SIGINT, SIG_IGN)
-
-    let toggle = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
-    toggle.setEventHandler { [weak self] in self?.toggle() }
-    toggle.resume()
-    signalSources.append(toggle)
-
-    for sig in [SIGTERM, SIGINT] {
-      let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-      src.setEventHandler { [weak self] in _ = self?.shutdown() }
-      src.resume()
-      signalSources.append(src)
+    var fds = [Int32](repeating: 0, count: 2)
+    guard pipe(&fds) == 0 else {
+      NSLog("Dictator: FATAL could not create signal pipe (errno \(errno))")
+      return
     }
+    let readFD = fds[0]
+    gSignalWriteFD = fds[1]
+    // Non-blocking read end so draining never stalls the main queue.
+    _ = fcntl(readFD, F_SETFL, fcntl(readFD, F_GETFL, 0) | O_NONBLOCK)
+
+    // Install real handlers (NOT SIG_IGN) that just poke the pipe.
+    signal(SIGUSR1, dictatorSignalHandler)
+    signal(SIGTERM, dictatorSignalHandler)
+    signal(SIGINT, dictatorSignalHandler)
+
+    let src = DispatchSource.makeReadSource(fileDescriptor: readFD, queue: .main)
+    src.setEventHandler { [weak self] in
+      guard let self = self else { return }
+      var buf = [UInt8](repeating: 0, count: 64)
+      let n = read(readFD, &buf, buf.count)
+      guard n > 0 else { return }
+      for i in 0..<n {
+        if Int32(buf[i]) == SIGUSR1 {
+          self.toggle()
+        } else {
+          self.shutdown()   // SIGTERM / SIGINT
+        }
+      }
+    }
+    src.resume()
+    signalReadSource = src
+    NSLog("Dictator: control channel ready (SIGUSR1=toggle, SIGTERM/SIGINT=quit)")
   }
 
   private func toggle() {
+    NSLog("Dictator: toggle received (state=\(state))")
     switch state {
     case .idle:         startRecording()
     case .recording:    stopAndTranscribe()
@@ -168,10 +206,15 @@ final class LinuxDaemon {
   // MARK: Recording pipeline (mirrors AppDelegate on macOS)
 
   private func startRecording() {
-    guard state == .idle else { return }
+    guard state == .idle else {
+      NSLog("Dictator: startRecording ignored (state=\(state))")
+      return
+    }
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("dictator-\(UUID().uuidString).wav")
+    NSLog("Dictator: starting recording via \(LinuxAudioRecorder.backendName ?? "NONE")")
     guard recorder.start(to: url) else {
+      NSLog("Dictator: ERROR could not start the audio recorder")
       Notify.show("Dictator", "No microphone recorder available (see logs)")
       return
     }
@@ -182,6 +225,7 @@ final class LinuxDaemon {
     if config.pauseMediaWhileRecording { media.pauseIfPlaying() }
     sounds.play(.start)
     Notify.show("🎙 Recording…")
+    NSLog("Dictator: recording — toggle again to stop")
   }
 
   private func stopAndTranscribe() {
@@ -194,6 +238,8 @@ final class LinuxDaemon {
 
     guard let url = currentWavURL else { state = .idle; return }
     currentWavURL = nil
+    let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil
+    NSLog("Dictator: stopped; transcribing \(url.lastPathComponent) (\(bytes ?? 0) bytes)")
 
     // Transcription is network I/O against the local server: do it off the main
     // queue, then hop back to insert text and reset state.
@@ -206,9 +252,14 @@ final class LinuxDaemon {
           let result = LinuxTextInserter.insert(text)
           self.sounds.play(.done)
           switch result {
-          case .pasted:        break
-          case .clipboardOnly: Notify.show("📋 Copied to clipboard", "Press Ctrl+V to paste")
-          case .failed:        Notify.show("Dictator", "Could not access the clipboard")
+          case .pasted:
+            NSLog("Dictator: inserted \(text.count) chars via synthetic paste")
+          case .clipboardOnly:
+            NSLog("Dictator: copied \(text.count) chars to clipboard (no paste tool)")
+            Notify.show("📋 Copied to clipboard", "Press Ctrl+V to paste")
+          case .failed:
+            NSLog("Dictator: ERROR could not set the clipboard")
+            Notify.show("Dictator", "Could not access the clipboard")
           }
           self.state = .idle
         }

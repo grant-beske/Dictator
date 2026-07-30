@@ -15,6 +15,7 @@ import Foundation
 // reads back is valid.
 final class LinuxAudioRecorder {
   private var process: Process?
+  private var errFileHandle: FileHandle?
   private(set) var isRecording = false
 
   // Returns (executable, args) for the first available backend, or nil if none.
@@ -55,7 +56,17 @@ final class LinuxAudioRecorder {
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     p.standardOutput = FileHandle.nullDevice
-    p.standardError = FileHandle.nullDevice
+    // Surface the recorder's own errors (no audio server, bad device, …) to our
+    // log instead of swallowing them — this is where "recording did nothing"
+    // usually explains itself.
+    let errPipe = Pipe()
+    p.standardError = errPipe
+    errPipe.fileHandleForReading.readabilityHandler = { handle in
+      let data = handle.availableData
+      guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty { NSLog("Dictator: recorder(\((exe as NSString).lastPathComponent)): \(trimmed)") }
+    }
     do {
       try p.run()
     } catch {
@@ -63,7 +74,9 @@ final class LinuxAudioRecorder {
       return false
     }
     process = p
+    errFileHandle = errPipe.fileHandleForReading
     isRecording = true
+    NSLog("Dictator: recorder \((exe as NSString).lastPathComponent) launched (pid \(p.processIdentifier))")
     return true
   }
 
@@ -71,6 +84,9 @@ final class LinuxAudioRecorder {
     guard isRecording, let p = process else { return }
     p.interrupt()          // SIGINT: recorder finalizes the WAV header, then exits
     p.waitUntilExit()
+    errFileHandle?.readabilityHandler = nil
+    errFileHandle = nil
+    NSLog("Dictator: recorder exited (status \(p.terminationStatus))")
     process = nil
     isRecording = false
   }
