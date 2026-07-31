@@ -148,6 +148,18 @@ headless in the container; audio/clipboard/evdev need a real desktop session.
   (`dictatorSignalHandler`) writes the signum to a pipe; a `DispatchSource` READ
   source drains it on `.main` and dispatches toggle/quit. Don't switch it back to
   a signal source. `SIGUSR1`=toggle, `SIGTERM`/`SIGINT`=quit.
+- **Never block the Linux daemon's main queue.** `dispatchMain()` services the
+  main queue (signal read source + evdev's `DispatchQueue.main.async` hops); block
+  it and the whole daemon freezes — no further toggles/keys register. In
+  particular `LinuxAudioRecorder.stop()` blocks up to ~3s (it SIGINTs the recorder
+  so it finalizes the WAV header, then polls for exit — it does NOT use
+  `Process.waitUntilExit()`, which can deadlock on Linux) so `stopAndTranscribe`
+  runs both the stop AND the transcription inside a `Task` off the main thread,
+  flipping `state` to `.transcribing` on main first so re-entry is refused.
+  Don't move recorder.stop() (or any blocking wait) back onto the main queue.
+- **Capture child stderr via a temp FILE, not a live `Pipe` + `readabilityHandler`**
+  — the latter can deadlock the process wait on Linux Foundation. The recorder
+  writes stderr to a `.stderr` sidecar file read back after exit.
 - **The Linux daemon logs each pipeline step via `NSLog`** (toggle received,
   recorder launched/exited with its stderr, transcribing N bytes, inserted/
   clipboard, shutdown) — the daemon is headless with no HUD, so this log (seen by

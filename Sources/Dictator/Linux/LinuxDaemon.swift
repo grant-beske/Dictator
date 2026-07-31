@@ -230,22 +230,26 @@ final class LinuxDaemon {
 
   private func stopAndTranscribe() {
     guard state == .recording else { return }
-    recorder.stop()
-    if config.pauseMediaWhileRecording { media.resumeIfPaused() }
+    // Flip state on the main thread FIRST so the event loop stays responsive and
+    // further toggles/evdev events are treated as "busy". The blocking recorder
+    // stop AND the network transcription then happen entirely off the main queue
+    // — doing recorder.stop() on main was what froze the daemon after one toggle.
     state = .transcribing
     sounds.play(.stop)
     Notify.show("⏳ Transcribing…")
 
     guard let url = currentWavURL else { state = .idle; return }
     currentWavURL = nil
-    let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil
-    NSLog("Dictator: stopped; transcribing \(url.lastPathComponent) (\(bytes ?? 0) bytes)")
 
-    // Transcription is network I/O against the local server: do it off the main
-    // queue, then hop back to insert text and reset state.
     Task { [weak self] in
       guard let self = self else { return }
       defer { try? FileManager.default.removeItem(at: url) }   // always clean up temp WAV
+      // recorder.stop() blocks until the WAV is flushed + the process exits.
+      self.recorder.stop()
+      if self.config.pauseMediaWhileRecording { self.media.resumeIfPaused() }
+      let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+      let size = (attrs?[.size] as? Int) ?? 0
+      NSLog("Dictator: stopped; transcribing \(url.lastPathComponent) (\(size) bytes)")
       do {
         let text = try await self.transcriber.transcribe(wavURL: url)
         DispatchQueue.main.async {

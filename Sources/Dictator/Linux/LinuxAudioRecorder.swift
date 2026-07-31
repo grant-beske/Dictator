@@ -1,5 +1,6 @@
 #if os(Linux)
 import Foundation
+import Glibc
 
 // Records microphone audio to a 16 kHz / 16-bit / mono WAV — exactly what
 // whisper.cpp expects — by driving a standard command-line recorder rather than
@@ -10,15 +11,16 @@ import Foundation
 //   ffmpeg    (Pulse input)
 //   arecord   (alsa-utils; raw ALSA fallback)
 //
-// Stopping sends SIGINT (Process.interrupt), which lets these tools finalize the
-// WAV header (patch the RIFF/data sizes) before they exit, so the file whisper
-// reads back is valid.
+// stop() sends SIGINT so these tools finalize the WAV header (patch the RIFF/data
+// sizes) before they exit, escalating to SIGKILL only if one ignores us. It can
+// block for up to a couple of seconds, so it MUST be called off the daemon's main
+// thread — blocking the main queue freezes the whole event loop.
 final class LinuxAudioRecorder {
   private var process: Process?
-  private var errFileHandle: FileHandle?
+  private var stderrURL: URL?
+  private var stderrHandle: FileHandle?
   private(set) var isRecording = false
 
-  // Returns (executable, args) for the first available backend, or nil if none.
   private static func command(for file: String) -> (String, [String])? {
     if let p = Shell.which("parecord") {
       return (p, ["--rate=16000", "--channels=1", "--format=s16le",
@@ -39,7 +41,6 @@ final class LinuxAudioRecorder {
     return nil
   }
 
-  // Human-readable name of the backend that would be used (for the startup log).
   static var backendName: String? {
     ["parecord", "pw-record", "ffmpeg", "arecord"].first { Shell.which($0) != nil }
   }
@@ -56,39 +57,65 @@ final class LinuxAudioRecorder {
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     p.standardOutput = FileHandle.nullDevice
-    // Surface the recorder's own errors (no audio server, bad device, …) to our
-    // log instead of swallowing them — this is where "recording did nothing"
-    // usually explains itself.
-    let errPipe = Pipe()
-    p.standardError = errPipe
-    errPipe.fileHandleForReading.readabilityHandler = { handle in
-      let data = handle.availableData
-      guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty { NSLog("Dictator: recorder(\((exe as NSString).lastPathComponent)): \(trimmed)") }
-    }
+    // Capture stderr to a temp FILE (read back after exit), NOT a live pipe with a
+    // readabilityHandler — the latter can deadlock the process wait on Linux.
+    let errURL = url.deletingPathExtension().appendingPathExtension("stderr")
+    _ = FileManager.default.createFile(atPath: errURL.path, contents: nil)
+    let errHandle = try? FileHandle(forWritingTo: errURL)
+    p.standardError = errHandle ?? FileHandle.nullDevice
     do {
       try p.run()
     } catch {
       NSLog("Dictator: failed to launch recorder \(exe): \(error)")
+      try? errHandle?.close()
+      try? FileManager.default.removeItem(at: errURL)
       return false
     }
     process = p
-    errFileHandle = errPipe.fileHandleForReading
+    stderrURL = errURL
+    stderrHandle = errHandle
     isRecording = true
     NSLog("Dictator: recorder \((exe as NSString).lastPathComponent) launched (pid \(p.processIdentifier))")
     return true
   }
 
+  // Blocks (up to ~3s) until the recorder flushes + exits. CALL OFF THE MAIN THREAD.
   func stop() {
     guard isRecording, let p = process else { return }
-    p.interrupt()          // SIGINT: recorder finalizes the WAV header, then exits
-    p.waitUntilExit()
-    errFileHandle?.readabilityHandler = nil
-    errFileHandle = nil
-    NSLog("Dictator: recorder exited (status \(p.terminationStatus))")
-    process = nil
     isRecording = false
+    p.interrupt()                                 // SIGINT: recorder finalizes the WAV
+    if !waitForExit(p, timeout: 2.0) {
+      NSLog("Dictator: recorder ignored SIGINT after 2s — sending SIGKILL")
+      kill(p.processIdentifier, SIGKILL)
+      _ = waitForExit(p, timeout: 1.0)
+    }
+    let status = p.isRunning ? "still running" : "\(p.terminationStatus)"
+    NSLog("Dictator: recorder exited (status \(status))")
+
+    // Surface anything the recorder printed to stderr (no audio server, bad
+    // device, …) — this is where a silent recording failure explains itself.
+    try? stderrHandle?.close()
+    if let errURL = stderrURL,
+       let data = try? Data(contentsOf: errURL),
+       let text = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+       !text.isEmpty {
+      NSLog("Dictator: recorder stderr: \(text)")
+    }
+    if let errURL = stderrURL { try? FileManager.default.removeItem(at: errURL) }
+    stderrHandle = nil
+    stderrURL = nil
+    process = nil
+  }
+
+  // Poll for exit instead of Process.waitUntilExit() (which can hang on Linux and
+  // would give a stuck recorder no upper time bound).
+  private func waitForExit(_ p: Process, timeout: Double) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while p.isRunning && Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.02)
+    }
+    return !p.isRunning
   }
 }
 #endif
