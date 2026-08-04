@@ -2,41 +2,50 @@
 import Foundation
 import Glibc
 
-// Records microphone audio to a 16 kHz / 16-bit / mono WAV — exactly what
-// whisper.cpp expects — by driving a standard command-line recorder rather than
-// linking an audio library. We pick the first backend that's installed:
+// Records microphone audio for whisper.cpp by driving a standard command-line
+// recorder — but as HEADERLESS raw PCM (S16LE, 16 kHz, mono). We write the WAV
+// header ourselves in stop(), so the resulting file is ALWAYS valid no matter how
+// the recorder process ended.
 //
+// Why not let the recorder write the WAV directly? Because a WAV's RIFF/data size
+// fields are only patched in when the tool exits cleanly, and parecord did NOT
+// exit on our stop signal in time — it got SIGKILLed, leaving an unfinalized
+// header that whisper-server rejects with HTTP 400. Recording raw + adding our own
+// header removes that whole failure mode (SIGKILL becomes harmless: the PCM the
+// kernel already flushed to the file is all we need).
+//
+// Backends, first installed wins:
 //   parecord  (pulseaudio-utils; works against PipeWire's Pulse shim too)
 //   pw-record (pipewire tools)
 //   ffmpeg    (Pulse input)
-//   arecord   (alsa-utils; raw ALSA fallback)
+//   arecord   (alsa-utils)
 //
-// stop() sends SIGINT so these tools finalize the WAV header (patch the RIFF/data
-// sizes) before they exit, escalating to SIGKILL only if one ignores us. It can
-// block for up to a couple of seconds, so it MUST be called off the daemon's main
-// thread — blocking the main queue freezes the whole event loop.
+// stop() can block ~1s waiting for the recorder to flush + exit, so it MUST be
+// called off the daemon's main thread.
 final class LinuxAudioRecorder {
   private var process: Process?
+  private var rawURL: URL?
+  private var wavURL: URL?
   private var stderrURL: URL?
   private var stderrHandle: FileHandle?
   private(set) var isRecording = false
 
-  private static func command(for file: String) -> (String, [String])? {
+  private static let sampleRate: UInt32 = 16_000
+
+  // (executable, args) writing raw S16LE 16 kHz mono PCM to `raw`.
+  private static func command(for raw: String) -> (String, [String])? {
     if let p = Shell.which("parecord") {
-      return (p, ["--rate=16000", "--channels=1", "--format=s16le",
-                  "--file-format=wav", file])
+      return (p, ["--raw", "--rate=16000", "--channels=1", "--format=s16le", raw])
     }
     if let p = Shell.which("pw-record") {
-      return (p, ["--rate=16000", "--channels=1", "--format=s16", file])
+      return (p, ["--raw", "--rate=16000", "--channels=1", "--format=s16", raw])
     }
     if let p = Shell.which("ffmpeg") {
-      return (p, ["-hide_banner", "-loglevel", "error",
-                  "-f", "pulse", "-i", "default",
-                  "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
-                  "-y", file])
+      return (p, ["-hide_banner", "-loglevel", "error", "-f", "pulse", "-i", "default",
+                  "-ar", "16000", "-ac", "1", "-f", "s16le", "-y", raw])
     }
     if let p = Shell.which("arecord") {
-      return (p, ["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", file])
+      return (p, ["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", raw])
     }
     return nil
   }
@@ -48,7 +57,8 @@ final class LinuxAudioRecorder {
   @discardableResult
   func start(to url: URL) -> Bool {
     guard !isRecording else { return true }
-    guard let (exe, args) = Self.command(for: url.path) else {
+    let raw = url.deletingPathExtension().appendingPathExtension("raw")
+    guard let (exe, args) = Self.command(for: raw.path) else {
       NSLog("Dictator: no audio recorder found — install one of "
           + "pulseaudio-utils, pipewire(-bin), ffmpeg, or alsa-utils")
       return false
@@ -57,7 +67,7 @@ final class LinuxAudioRecorder {
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     p.standardOutput = FileHandle.nullDevice
-    // Capture stderr to a temp FILE (read back after exit), NOT a live pipe with a
+    // Capture stderr to a temp FILE (read after exit), NOT a live pipe with a
     // readabilityHandler — the latter can deadlock the process wait on Linux.
     let errURL = url.deletingPathExtension().appendingPathExtension("stderr")
     _ = FileManager.default.createFile(atPath: errURL.path, contents: nil)
@@ -72,6 +82,8 @@ final class LinuxAudioRecorder {
       return false
     }
     process = p
+    rawURL = raw
+    wavURL = url
     stderrURL = errURL
     stderrHandle = errHandle
     isRecording = true
@@ -79,37 +91,63 @@ final class LinuxAudioRecorder {
     return true
   }
 
-  // Blocks (up to ~3s) until the recorder flushes + exits. CALL OFF THE MAIN THREAD.
+  // Stop the recorder and write a valid WAV at the URL passed to start().
+  // CALL OFF THE MAIN THREAD (blocks up to ~1.5s).
   func stop() {
     guard isRecording, let p = process else { return }
     isRecording = false
-    p.interrupt()                                 // SIGINT: recorder finalizes the WAV
-    if !waitForExit(p, timeout: 2.0) {
-      NSLog("Dictator: recorder ignored SIGINT after 2s — sending SIGKILL")
+    // SIGTERM = clean stop (recorder flushes its last buffer + exits); parecord/
+    // ffmpeg/arecord all handle it. Send it directly rather than via
+    // Process.interrupt() so there's no ambiguity about delivery.
+    kill(p.processIdentifier, SIGTERM)
+    if !waitForExit(p, timeout: 1.0) {
+      NSLog("Dictator: recorder didn't exit on SIGTERM — sending SIGKILL")
       kill(p.processIdentifier, SIGKILL)
-      _ = waitForExit(p, timeout: 1.0)
+      _ = waitForExit(p, timeout: 0.5)
     }
     let status = p.isRunning ? "still running" : "\(p.terminationStatus)"
-    NSLog("Dictator: recorder exited (status \(status))")
 
-    // Surface anything the recorder printed to stderr (no audio server, bad
-    // device, …) — this is where a silent recording failure explains itself.
     try? stderrHandle?.close()
-    if let errURL = stderrURL,
-       let data = try? Data(contentsOf: errURL),
+    logStderr()
+    let pcmBytes = wrapRawAsWav()   // <- WAV validity no longer depends on the exit
+    NSLog("Dictator: recorder stopped (exit \(status)); captured \(pcmBytes) PCM bytes")
+
+    process = nil; rawURL = nil; wavURL = nil; stderrURL = nil; stderrHandle = nil
+  }
+
+  // Read the raw PCM and write `wavURL` = 44-byte WAV header + PCM. Returns the
+  // number of PCM bytes (0 if nothing was captured).
+  private func wrapRawAsWav() -> Int {
+    guard let rawURL = rawURL, let wavURL = wavURL else { return 0 }
+    defer { try? FileManager.default.removeItem(at: rawURL) }
+    guard let pcm = try? Data(contentsOf: rawURL) else { return 0 }
+
+    let dataSize = UInt32(truncatingIfNeeded: pcm.count)
+    let sr = Self.sampleRate
+    var d = Data()
+    func u32(_ v: UInt32) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
+    func u16(_ v: UInt16) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 2)) }
+    d.append(Data("RIFF".utf8)); u32(36 &+ dataSize); d.append(Data("WAVE".utf8))
+    d.append(Data("fmt ".utf8)); u32(16); u16(1); u16(1)          // PCM, mono
+    u32(sr); u32(sr &* 2); u16(2); u16(16)                        // byterate, block align, bits
+    d.append(Data("data".utf8)); u32(dataSize)
+    d.append(pcm)
+    try? d.write(to: wavURL)
+    return pcm.count
+  }
+
+  private func logStderr() {
+    guard let errURL = stderrURL else { return }
+    defer { try? FileManager.default.removeItem(at: errURL) }
+    if let data = try? Data(contentsOf: errURL),
        let text = String(data: data, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
        !text.isEmpty {
       NSLog("Dictator: recorder stderr: \(text)")
     }
-    if let errURL = stderrURL { try? FileManager.default.removeItem(at: errURL) }
-    stderrHandle = nil
-    stderrURL = nil
-    process = nil
   }
 
-  // Poll for exit instead of Process.waitUntilExit() (which can hang on Linux and
-  // would give a stuck recorder no upper time bound).
+  // Poll for exit instead of Process.waitUntilExit() (which can hang on Linux).
   private func waitForExit(_ p: Process, timeout: Double) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while p.isRunning && Date() < deadline {

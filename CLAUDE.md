@@ -160,6 +160,16 @@ headless in the container; audio/clipboard/evdev need a real desktop session.
 - **Capture child stderr via a temp FILE, not a live `Pipe` + `readabilityHandler`**
   — the latter can deadlock the process wait on Linux Foundation. The recorder
   writes stderr to a `.stderr` sidecar file read back after exit.
+- **`LinuxAudioRecorder` records HEADERLESS raw PCM (`--raw`, s16le/16k/mono) and
+  writes the WAV header itself in `stop()`.** Do NOT go back to letting the
+  recorder write the WAV: a WAV's RIFF/data sizes are only patched in on a clean
+  exit, and parecord did NOT exit on our stop signal in time — it got SIGKILLed,
+  leaving an unfinalized header that whisper-server rejects with HTTP 400.
+  Recording raw + wrapping it ourselves makes the WAV valid regardless of how the
+  recorder died (SIGKILL just loses the last unflushed buffer). Stop uses a direct
+  `kill(pid, SIGTERM)` (not `Process.interrupt()`) + bounded poll + SIGKILL
+  fallback. The header bytes match `makeSilentWav` (proven accepted by the real
+  server via prewarm).
 - **The Linux daemon logs each pipeline step via `NSLog`** (toggle received,
   recorder launched/exited with its stderr, transcribing N bytes, inserted/
   clipboard, shutdown) — the daemon is headless with no HUD, so this log (seen by
