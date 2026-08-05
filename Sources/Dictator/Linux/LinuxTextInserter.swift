@@ -46,12 +46,12 @@ enum LinuxTextInserter {
 
     for (tool, args) in order {
       guard let path = Shell.which(tool) else { continue }
-      let rc = Shell.run(path, args, stdin: text)
-      if rc == 0 {
+      // Detached: these tools stay alive to OWN the selection, so we must not
+      // wait for them (waiting is what froze the daemon after a transcription).
+      if Shell.runDetached(path, args, stdin: text) {
         NSLog("Dictator: clipboard set via \(tool)")
         return true
       }
-      NSLog("Dictator: \(tool) failed (exit \(rc))")
     }
     NSLog("Dictator: NO clipboard tool found — install wl-clipboard (Wayland) or xclip (X11)")
     return false

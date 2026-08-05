@@ -35,7 +35,11 @@ final class LinuxAudioRecorder {
   // (executable, args) writing raw S16LE 16 kHz mono PCM to `raw`.
   private static func command(for raw: String) -> (String, [String])? {
     if let p = Shell.which("parecord") {
-      return (p, ["--raw", "--rate=16000", "--channels=1", "--format=s16le", raw])
+      // --latency-msec=30 forces parecord to flush to the file every ~30 ms.
+      // Without it, parecord buffers a large chunk and a short (<~2 s) hold is
+      // lost entirely when the process is killed — you'd get a 0-byte capture.
+      return (p, ["--raw", "--latency-msec=30", "--rate=16000", "--channels=1",
+                  "--format=s16le", raw])
     }
     if let p = Shell.which("pw-record") {
       return (p, ["--raw", "--rate=16000", "--channels=1", "--format=s16", raw])
@@ -96,14 +100,14 @@ final class LinuxAudioRecorder {
   func stop() {
     guard isRecording, let p = process else { return }
     isRecording = false
-    // SIGTERM = clean stop (recorder flushes its last buffer + exits); parecord/
-    // ffmpeg/arecord all handle it. Send it directly rather than via
-    // Process.interrupt() so there's no ambiguity about delivery.
+    // SIGTERM first (clean), then SIGKILL quickly. With --latency-msec the PCM is
+    // already flushed to the file continuously, so a hard kill costs only ~30 ms
+    // of audio — no need to wait long for a recorder that's slow to exit (parecord
+    // via the PipeWire-Pulse shim often is).
     kill(p.processIdentifier, SIGTERM)
-    if !waitForExit(p, timeout: 1.0) {
-      NSLog("Dictator: recorder didn't exit on SIGTERM — sending SIGKILL")
+    if !waitForExit(p, timeout: 0.4) {
       kill(p.processIdentifier, SIGKILL)
-      _ = waitForExit(p, timeout: 0.5)
+      _ = waitForExit(p, timeout: 0.4)
     }
     let status = p.isRunning ? "still running" : "\(p.terminationStatus)"
 

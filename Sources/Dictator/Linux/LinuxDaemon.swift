@@ -83,6 +83,9 @@ final class LinuxDaemon {
   private var evdev: LinuxEvdevInput?
   private var currentWavURL: URL?
   private var signalReadSource: DispatchSourceRead?
+  // Media pause/resume runs here (off the main thread, serialized) so a slow
+  // playerctl/D-Bus call can never block the daemon's event loop.
+  private let mediaQueue = DispatchQueue(label: "dictator.media")
 
   // MARK: Daemon lifecycle
 
@@ -108,6 +111,10 @@ final class LinuxDaemon {
     installSignalHandlers()
     startInput()
 
+    // Kill any whisper-server left over from a previous daemon that didn't shut
+    // down cleanly (e.g. a `kill -9`). Otherwise the orphan keeps holding GPU
+    // VRAM and our fresh server hits cudaMalloc OOM and crash-loops.
+    killStaleServers()
     server.start()
     prewarmServer()
 
@@ -122,11 +129,21 @@ final class LinuxDaemon {
   private func shutdown() -> Never {
     NSLog("Dictator: shutting down")
     if state == .recording { recorder.stop() }
-    if config.pauseMediaWhileRecording { media.resumeIfPaused() }
     evdev?.stop()
-    server?.stop()
+    server?.stop()               // terminate whisper-server so it frees GPU VRAM
     LinuxDaemon.removePidFile()
     exit(0)
+  }
+
+  // Kill any whisper-server left over from a previous daemon that didn't exit
+  // cleanly (a `kill -9`, a crash). An orphan keeps holding GPU VRAM, which on a
+  // small card (e.g. a 4 GB Quadro) makes our fresh server OOM and crash-loop.
+  private func killStaleServers() {
+    guard let pkill = Shell.which("pkill") else { return }
+    if Shell.run(pkill, ["-f", "whisper-server"], timeout: 3.0) == 0 {
+      NSLog("Dictator: killed leftover whisper-server(s); waiting for VRAM to free")
+      Thread.sleep(forTimeInterval: 0.5)   // let the GPU release the memory
+    }
   }
 
   // MARK: Input wiring
@@ -220,9 +237,11 @@ final class LinuxDaemon {
     }
     currentWavURL = url
     state = .recording
-    // Pause media only after recording actually started, so a failed start
-    // never leaves the user's music paused.
-    if config.pauseMediaWhileRecording { media.pauseIfPlaying() }
+    // Pause media off the main thread (playerctl/D-Bus can be slow) and only
+    // after recording actually started, so a failed start never leaves it paused.
+    if config.pauseMediaWhileRecording {
+      mediaQueue.async { [weak self] in self?.media.pauseIfPlaying() }
+    }
     sounds.play(.start)
     Notify.show("🎙 Recording…")
     NSLog("Dictator: recording — toggle again to stop")
@@ -240,30 +259,38 @@ final class LinuxDaemon {
 
     guard let url = currentWavURL else { state = .idle; return }
     currentWavURL = nil
+    if config.pauseMediaWhileRecording {
+      mediaQueue.async { [weak self] in self?.media.resumeIfPaused() }
+    }
 
     Task { [weak self] in
       guard let self = self else { return }
       defer { try? FileManager.default.removeItem(at: url) }   // always clean up temp WAV
-      // recorder.stop() blocks until the WAV is flushed + the process exits.
+      // recorder.stop() blocks ~0.4s (kills the recorder + builds the WAV).
       self.recorder.stop()
-      if self.config.pauseMediaWhileRecording { self.media.resumeIfPaused() }
       let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
       let size = (attrs?[.size] as? Int) ?? 0
-      NSLog("Dictator: stopped; transcribing \(url.lastPathComponent) (\(size) bytes)")
+      // A 44-byte file is a header with no audio (hold too short to capture any) —
+      // don't POST it (whisper-server would 400) and tell the user why.
+      guard size > 44 else {
+        NSLog("Dictator: no audio captured (\(size) bytes) — hold the key a moment longer")
+        Notify.show("Dictator", "No audio captured — hold the key a moment longer")
+        DispatchQueue.main.async { self.state = .idle }
+        return
+      }
+      NSLog("Dictator: transcribing \(url.lastPathComponent) (\(size) bytes)")
       do {
         let text = try await self.transcriber.transcribe(wavURL: url)
+        // Insert (clipboard + best-effort paste) HERE, off the main thread. The
+        // clipboard owner keeps running to serve the selection, so waiting for it
+        // on the main queue is exactly what froze the daemon after a transcription.
+        let result = LinuxTextInserter.insert(text)
         DispatchQueue.main.async {
-          let result = LinuxTextInserter.insert(text)
           self.sounds.play(.done)
           switch result {
-          case .pasted:
-            NSLog("Dictator: inserted \(text.count) chars via synthetic paste")
-          case .clipboardOnly:
-            NSLog("Dictator: copied \(text.count) chars to clipboard (no paste tool)")
-            Notify.show("📋 Copied to clipboard", "Press Ctrl+V to paste")
-          case .failed:
-            NSLog("Dictator: ERROR could not set the clipboard")
-            Notify.show("Dictator", "Could not access the clipboard")
+          case .pasted:        break   // insert() already logged the tool used
+          case .clipboardOnly: Notify.show("📋 Copied to clipboard", "Press Ctrl+V to paste")
+          case .failed:        Notify.show("Dictator", "Could not access the clipboard")
           }
           self.state = .idle
         }

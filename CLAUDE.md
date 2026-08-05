@@ -148,15 +148,26 @@ headless in the container; audio/clipboard/evdev need a real desktop session.
   (`dictatorSignalHandler`) writes the signum to a pipe; a `DispatchSource` READ
   source drains it on `.main` and dispatches toggle/quit. Don't switch it back to
   a signal source. `SIGUSR1`=toggle, `SIGTERM`/`SIGINT`=quit.
-- **Never block the Linux daemon's main queue.** `dispatchMain()` services the
-  main queue (signal read source + evdev's `DispatchQueue.main.async` hops); block
-  it and the whole daemon freezes — no further toggles/keys register. In
-  particular `LinuxAudioRecorder.stop()` blocks up to ~3s (it SIGINTs the recorder
-  so it finalizes the WAV header, then polls for exit — it does NOT use
-  `Process.waitUntilExit()`, which can deadlock on Linux) so `stopAndTranscribe`
-  runs both the stop AND the transcription inside a `Task` off the main thread,
-  flipping `state` to `.transcribing` on main first so re-entry is refused.
-  Don't move recorder.stop() (or any blocking wait) back onto the main queue.
+- **Never block the Linux daemon's main queue — this has bitten us repeatedly.**
+  `dispatchMain()` services the main queue (signal read source + evdev's
+  `DispatchQueue.main.async` hops); block it and the WHOLE daemon freezes — no
+  toggles, no keys, and `dictator quit` stops working (SIGTERM routes through the
+  self-pipe → main). So EVERYTHING that shells out or waits runs off the main
+  thread: `stopAndTranscribe` does the recorder stop, the network transcription,
+  AND the clipboard/paste insert inside a `Task` (flipping `state` to
+  `.transcribing` on main first so re-entry is refused); media pause/resume runs
+  on `mediaQueue`; `Notify.show` is fire-and-forget (`Shell.spawn`). The main
+  thread only does quick state flips and hands work off. Belt-and-suspenders:
+  `Shell.run` has an 8s timeout+SIGKILL so no external tool can hang a caller
+  forever, and clipboard owners (wl-copy/xclip/xsel) go through
+  `Shell.runDetached` (they stay alive to serve the selection, so you must NOT
+  wait on them — waiting was the freeze after a successful transcription).
+- **On startup the daemon `pkill`s stale `whisper-server`s** (`killStaleServers`)
+  so an orphan from a previous `kill -9` doesn't keep holding GPU VRAM and OOM the
+  fresh server on a small card. `shutdown()` calls `server.stop()` to free VRAM.
+- **Short holds need `--latency-msec=30` on parecord**, or it buffers and a <~2s
+  recording is lost entirely when killed (0-byte capture → whisper 400). The Task
+  also skips WAVs ≤44 bytes (header only) rather than POSTing an empty file.
 - **Capture child stderr via a temp FILE, not a live `Pipe` + `readabilityHandler`**
   — the latter can deadlock the process wait on Linux Foundation. The recorder
   writes stderr to a `.stderr` sidecar file read back after exit.

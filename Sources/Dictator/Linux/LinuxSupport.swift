@@ -27,10 +27,19 @@ enum Shell {
     names.first { which($0) != nil }
   }
 
-  // Run a command to completion. If `stdin` is given it's written to the child's
-  // standard input, then closed. Returns the exit status (or -1 on spawn error).
+  // Retains detached processes (and their stdin pipes) so they aren't torn down
+  // before the child consumes stdin. Pruned on each runDetached call.
+  private static var detached: [Process] = []
+  private static let detachedLock = NSLock()
+
+  // Run a command to completion, but NEVER block indefinitely: if it outlives
+  // `timeout` it's SIGKILLed and we return -2. (A hung external tool must not be
+  // able to wedge a caller — this is what froze the daemon before.) If `stdin` is
+  // given it's written to the child's standard input, then closed. Returns the
+  // exit status, -1 on spawn error, or -2 on timeout.
   @discardableResult
-  static func run(_ exe: String, _ args: [String], stdin: String? = nil) -> Int32 {
+  static func run(_ exe: String, _ args: [String], stdin: String? = nil,
+                  timeout: Double = 8.0) -> Int32 {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
@@ -53,8 +62,39 @@ enum Shell {
       inPipe.fileHandleForWriting.write(data)
       inPipe.fileHandleForWriting.closeFile()
     }
-    p.waitUntilExit()
+    let deadline = Date().addingTimeInterval(timeout)
+    while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+    if p.isRunning {
+      NSLog("Dictator: \((exe as NSString).lastPathComponent) exceeded \(timeout)s — killing")
+      kill(p.processIdentifier, SIGKILL)
+      return -2
+    }
     return p.terminationStatus
+  }
+
+  // Launch a tool, feed it stdin, and DON'T wait — for clipboard owners (wl-copy,
+  // xclip, xsel) that must KEEP RUNNING to serve the selection, so waiting for
+  // them to "finish" would block forever. Returns true if it launched.
+  @discardableResult
+  static func runDetached(_ exe: String, _ args: [String], stdin: String) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    let inPipe = Pipe()
+    p.standardInput = inPipe
+    do { try p.run() } catch {
+      NSLog("Dictator: failed to run \(exe): \(error)")
+      return false
+    }
+    inPipe.fileHandleForWriting.write(Data(stdin.utf8))
+    inPipe.fileHandleForWriting.closeFile()
+    detachedLock.lock()
+    detached.removeAll { !$0.isRunning }   // reap finished selection owners
+    detached.append(p)
+    detachedLock.unlock()
+    return true
   }
 
   // Run a command and capture its trimmed stdout (empty string on failure).
@@ -112,7 +152,8 @@ enum Notify {
 
   static func show(_ title: String, _ body: String = "") {
     guard let tool = tool else { return }
-    _ = Shell.run(tool, ["-a", "Dictator", "-t", "2500", title, body])
+    // Fire-and-forget: a slow notification daemon must never delay the pipeline.
+    Shell.spawn(tool, ["-a", "Dictator", "-t", "2500", title, body])
   }
 }
 
