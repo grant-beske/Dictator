@@ -48,6 +48,14 @@ struct Config: Codable {
   // newlines whisper otherwise inserts.
   var noTimestamps: Bool
 
+  // Style/vocabulary hint handed to whisper as if it were the preceding
+  // transcript. Whisper copies the style of its context, so a properly
+  // punctuated, capitalized prompt keeps it from drifting into the lowercase,
+  // unpunctuated "sloppy subtitle" style on casual run-on speech. You can also
+  // append names or jargon you dictate often to improve their spelling. Set to
+  // "" to disable.
+  var initialPrompt: String
+
   // Linux only (ignored on macOS). How the daemon starts/stops recording:
   //  - "socket": toggle mode — bind a desktop keyboard shortcut to
   //    `dictator toggle`, which signals the running daemon. No special
@@ -74,6 +82,7 @@ struct Config: Codable {
     beamSize: 3,
     bestOf: 5,
     noTimestamps: true,
+    initialPrompt: "Hello. This is a carefully punctuated transcript, with proper capitalization. I think it's working well, isn't it?",
     linuxInputMode: "socket",
     linuxPushToTalkKey: 97          // KEY_RIGHTCTRL
   )
@@ -96,7 +105,7 @@ struct Config: Codable {
        toggleKeyCode: Int, toggleModifiers: [String], serverPort: Int,
        language: String, soundsEnabled: Bool, pauseMediaWhileRecording: Bool,
        waveformGain: Double, beamSize: Int, bestOf: Int, noTimestamps: Bool,
-       linuxInputMode: String, linuxPushToTalkKey: Int) {
+       initialPrompt: String, linuxInputMode: String, linuxPushToTalkKey: Int) {
     self.modelPath = modelPath
     self.hotkeyMode = hotkeyMode
     self.pushToTalkModifiers = pushToTalkModifiers
@@ -110,6 +119,7 @@ struct Config: Codable {
     self.beamSize = beamSize
     self.bestOf = bestOf
     self.noTimestamps = noTimestamps
+    self.initialPrompt = initialPrompt
     self.linuxInputMode = linuxInputMode
     self.linuxPushToTalkKey = linuxPushToTalkKey
   }
@@ -136,6 +146,7 @@ struct Config: Codable {
     beamSize = g(.beamSize, d.beamSize)
     bestOf = g(.bestOf, d.bestOf)
     noTimestamps = g(.noTimestamps, d.noTimestamps)
+    initialPrompt = g(.initialPrompt, d.initialPrompt)
     linuxInputMode = g(.linuxInputMode, d.linuxInputMode)
     linuxPushToTalkKey = g(.linuxPushToTalkKey, d.linuxPushToTalkKey)
   }

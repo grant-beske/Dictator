@@ -103,7 +103,8 @@ final class LinuxDaemon {
                            beamSize: config.beamSize,
                            bestOf: config.bestOf,
                            noTimestamps: config.noTimestamps)
-    transcriber = Transcriber(port: config.serverPort, language: config.language)
+    transcriber = Transcriber(port: config.serverPort, language: config.language,
+                              initialPrompt: config.initialPrompt)
     sounds.enabled = config.soundsEnabled
     sounds.ensureDirectory()
 

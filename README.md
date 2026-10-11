@@ -123,7 +123,8 @@ with defaults on first launch). Edit it via the menu's **Edit Config…**, then
   "waveformGain": 1.4,
   "beamSize": 3,
   "bestOf": 5,
-  "noTimestamps": true
+  "noTimestamps": true,
+  "initialPrompt": "Hello. This is a carefully punctuated transcript, with proper capitalization. I think it's working well, isn't it?"
 }
 ```
 
@@ -131,6 +132,12 @@ with defaults on first launch). Edit it via the menu's **Edit Config…**, then
   balance of speed and accuracy). Lower them toward `1`/`1` for greedy decoding
   (fastest) if you want more speed on clean audio. `noTimestamps: true` is
   slightly faster and avoids whisper's per-segment newlines.
+
+- **Punctuation & vocabulary:** `initialPrompt` is a short style hint given to
+  whisper as if it were the preceding transcript. The default is a properly
+  punctuated sentence, which keeps whisper from drifting into lowercase,
+  unpunctuated output on casual run-on speech. Append names or jargon you
+  dictate often to improve their spelling; set it to `""` to disable.
 
 - **Tune the waveform:** raise `waveformGain` (e.g. `2.0`) if the bars barely
   move when you speak; lower it if they're always pinned to full height.
@@ -287,7 +294,7 @@ reliable option, since clipboard/notifications/audio all need session env vars).
 
 Config lives at `~/.config/dictator/config.json` (created on first run). The
 cross-platform keys (`modelPath`, `language`, `serverPort`, `beamSize`, `bestOf`,
-`noTimestamps`, `soundsEnabled`, `pauseMediaWhileRecording`) work as on macOS.
+`noTimestamps`, `initialPrompt`, `soundsEnabled`, `pauseMediaWhileRecording`) work as on macOS.
 The macOS-only keys (`hotkeyMode`, `pushToTalkModifiers`, `toggle*`,
 `waveformGain`) are ignored. Two keys are Linux-specific:
 

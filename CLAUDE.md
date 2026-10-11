@@ -227,6 +227,14 @@ section to match).
 - whisper sometimes hallucinates a leading dash/bullet (`- `, a subtitle/dialogue
   marker). `Transcriber` strips a leading run of `- – — • *` + whitespace from the
   start only, so mid-sentence dashes (`twenty-one`, `well — maybe`) survive.
+- whisper sometimes drifts into lowercase, unpunctuated output (it was trained on
+  sloppy subtitles too, and each 30s window copies the previous window's style).
+  `Config.initialPrompt` — a punctuated, capitalized sentence — is sent by
+  `Transcriber` as the per-request `prompt` field with `carry_initial_prompt=true`
+  so it applies to every window, not just the first. It is deliberately a request
+  field, NOT a server `--prompt`/`--carry-initial-prompt` flag: an older
+  whisper-server (e.g. a Linux distro build) ignores unknown request fields but
+  would refuse to start on an unknown flag. Empty string disables it.
 - Server is pre-warmed at launch with one silent inference (`AppDelegate
   .prewarmServer`) so the first real dictation isn't slow.
 

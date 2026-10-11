@@ -30,7 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            beamSize: config.beamSize,
                            bestOf: config.bestOf,
                            noTimestamps: config.noTimestamps)
-    transcriber = Transcriber(port: config.serverPort, language: config.language)
+    transcriber = Transcriber(port: config.serverPort, language: config.language,
+                              initialPrompt: config.initialPrompt)
 
     setupStatusItem()
     wireHotkeys()
